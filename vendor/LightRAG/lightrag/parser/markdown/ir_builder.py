@@ -1,0 +1,254 @@
+"""Native Markdown IR builder: ``extract_markdown`` output → :class:`IRDoc`.
+
+Input contract: the block dicts and side tables produced by
+:func:`lightrag.parser.markdown.extract.extract_markdown`, threaded through
+``NativeMarkdownParser.extract`` as ``(blocks, _, metadata)``. ``metadata``
+carries the marker→payload side tables under the ``md_*`` keys.
+
+Each block's ``content`` holds self-closing markers (``<mdtable ref=…/>`` /
+``<mdequation ref=…/>`` / ``<mddrawing ref=…/>``). This builder rewrites them
+into IR placeholder tokens (``{{TBL:k}}`` / ``{{EQ:k}}`` / ``{{IMG:k}}``) and
+builds the matching :class:`IRTable` / :class:`IREquation` / :class:`IRDrawing`
+from the side tables.
+
+Image bytes are carried in ``metadata["md_assets"]`` (keyed by a stable
+identity), so assets are declared as ``AssetSpec(source=bytes)`` and the writer
+materializes + deduplicates them. External-link images carry no bytes; the URL
+lands in the drawing's ``src`` and ``path`` stays empty.
+"""
+
+from __future__ import annotations
+
+import itertools
+import re
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from lightrag.parser._html_table import (
+    extract_html_table_info,
+    extract_thead_html,
+    html_table_inner_body,
+    unwrap_html_table,
+)
+from lightrag.parser.markdown.extract import (
+    DRAWING_MARKER_RE,
+    EQUATION_MARKER_RE,
+    PREFACE_HEADING,
+    TABLE_MARKER_RE,
+)
+from lightrag.sidecar.ir import (
+    AssetSpec,
+    IRBlock,
+    IRDoc,
+    IRDrawing,
+    IREquation,
+    IRPosition,
+    IRTable,
+)
+from lightrag.sidecar.placeholders import PLACEHOLDER_TOKEN_RE
+
+
+def _placeholder_keyspace(reserved: set[str]) -> Callable[[str], str]:
+    counter = itertools.count(1)
+
+    def next_key(prefix: str) -> str:
+        while True:
+            key = f"{prefix}{next(counter)}"
+            if key not in reserved:
+                return key
+
+    return next_key
+
+
+class NativeMarkdownIRBuilder:
+    """Translate ``extract_markdown`` output into an :class:`IRDoc`.
+
+    Stateless — instantiate per call. ``asset_dir_name`` is the relative name
+    of ``<base>.blocks.assets/``; the writer applies it as the on-disk prefix
+    via ``block_drawing_path_style="with_prefix"``.
+    """
+
+    def normalize(
+        self,
+        blocks: list[dict[str, Any]],
+        *,
+        document_name: str,
+        asset_dir_name: str,
+        parse_metadata: dict[str, Any] | None = None,
+    ) -> IRDoc:
+        meta = parse_metadata or {}
+        tables_meta: dict[str, dict] = meta.get("md_tables") or {}
+        equations_meta: dict[str, str] = meta.get("md_equations") or {}
+        drawings_meta: dict[str, dict] = meta.get("md_drawings") or {}
+        assets_meta: dict[str, dict] = meta.get("md_assets") or {}
+
+        # Reserve author-written IR token examples across the whole document.
+        source_keys = {
+            match.group(2)
+            for block in blocks
+            for match in PLACEHOLDER_TOKEN_RE.finditer(block.get("content") or "")
+        }
+        next_key = _placeholder_keyspace(source_keys)
+        ir_blocks: list[IRBlock] = []
+        assets: list[AssetSpec] = []
+        seen_asset_refs: set[str] = set()
+        doc_title = ""
+
+        for block in blocks:
+            content = block.get("content") or ""
+            heading = block.get("heading") or ""
+            level = int(block.get("level", 0) or 0)
+            parent_headings = list(block.get("parent_headings") or [])
+
+            tables: list[IRTable] = []
+            equations: list[IREquation] = []
+            drawings: list[IRDrawing] = []
+
+            def _replace_table(match: "re.Match[str]") -> str:
+                ref = match.group(1)
+                if ref not in tables_meta:
+                    return match.group(0)
+                spec = tables_meta[ref] or {}
+                placeholder = next_key("tb")
+                tables.append(_build_table(placeholder, spec))
+                return f"{{{{TBL:{placeholder}}}}}"
+
+            def _replace_equation(match: "re.Match[str]") -> str:
+                ref = match.group(1)
+                if ref not in equations_meta:
+                    return match.group(0)
+                latex = equations_meta[ref]
+                placeholder = next_key("eq")
+                equations.append(
+                    IREquation(placeholder_key=placeholder, latex=latex, is_block=True)
+                )
+                return f"{{{{EQ:{placeholder}}}}}"
+
+            def _replace_drawing(match: "re.Match[str]") -> str:
+                ref = match.group(1)
+                if ref not in drawings_meta:
+                    return match.group(0)
+                spec = drawings_meta[ref] or {}
+                placeholder = next_key("im")
+                drawings.append(
+                    _build_drawing(
+                        placeholder, spec, assets_meta, assets, seen_asset_refs
+                    )
+                )
+                return f"{{{{IMG:{placeholder}}}}}"
+
+            content = TABLE_MARKER_RE.sub(_replace_table, content)
+            content = EQUATION_MARKER_RE.sub(_replace_equation, content)
+            content = DRAWING_MARKER_RE.sub(_replace_drawing, content)
+
+            anchor = heading if heading and heading != PREFACE_HEADING else None
+            positions = [IRPosition(type="heading", anchor=anchor)]
+
+            ir_blocks.append(
+                IRBlock(
+                    content_template=content,
+                    heading=heading,
+                    level=level,
+                    parent_headings=parent_headings,
+                    positions=positions,
+                    tables=tables,
+                    drawings=drawings,
+                    equations=equations,
+                )
+            )
+
+            if not doc_title and level == 1 and heading and heading != PREFACE_HEADING:
+                doc_title = heading
+
+        if not doc_title:
+            doc_title = Path(document_name).stem or document_name
+
+        return IRDoc(
+            document_name=document_name,
+            document_format=Path(document_name).suffix.lower().lstrip("."),
+            doc_title=doc_title,
+            split_option={},
+            blocks=ir_blocks,
+            assets=assets,
+            bbox_attributes=None,
+        )
+
+
+def _build_table(placeholder: str, spec: dict) -> IRTable:
+    if spec.get("kind") == "html":
+        raw = str(spec.get("html") or "")
+        html = unwrap_html_table(raw) or None
+        body_override = html_table_inner_body(html) or None if html else None
+        info = extract_html_table_info(html or "")
+        return IRTable(
+            placeholder_key=placeholder,
+            rows=None,
+            html=html,
+            num_rows=info.num_rows,
+            num_cols=info.num_cols,
+            table_header=extract_thead_html(html or ""),
+            body_override=body_override,
+        )
+    # pipe table
+    header = spec.get("header")
+    # Header recovery expects the original header to remain in the table body.
+    rows = [
+        [str(c) for c in row]
+        for row in itertools.chain(header or [], spec.get("rows") or [])
+    ]
+    # Every row, header included, is padded to the widest row. Unlike GFM,
+    # cells past the header width are kept, not dropped: they are usually an
+    # unescaped ``|`` inside a cell, and dropping them would remove that text
+    # from the index without a trace.
+    num_cols = max((len(r) for r in rows), default=0)
+    rows = [row + [""] * (num_cols - len(row)) for row in rows]
+    return IRTable(
+        placeholder_key=placeholder,
+        rows=rows,
+        html=None,
+        num_rows=len(rows),
+        num_cols=num_cols,
+        table_header=rows[: len(header)] if header else None,
+    )
+
+
+def _build_drawing(
+    placeholder: str,
+    spec: dict,
+    assets_meta: dict[str, dict],
+    assets: list[AssetSpec],
+    seen_asset_refs: set[str],
+) -> IRDrawing:
+    fmt = str(spec.get("fmt") or "")
+    src = str(spec.get("src") or "")
+    if spec.get("kind") == "external":
+        # No bytes were materialized (download failed), so path stays empty
+        # (asset_ref="" resolves to path="" in the writer) and the original
+        # URL survives only as src metadata.
+        return IRDrawing(
+            placeholder_key=placeholder,
+            asset_ref="",
+            fmt=fmt,
+            src=src or str(spec.get("url") or ""),
+        )
+    asset_ref = str(spec.get("asset_ref") or "")
+    if asset_ref and asset_ref not in seen_asset_refs:
+        asset = assets_meta.get(asset_ref) or {}
+        assets.append(
+            AssetSpec(
+                ref=asset_ref,
+                suggested_name=str(asset.get("suggested_name") or asset_ref),
+                source=asset.get("data"),
+            )
+        )
+        seen_asset_refs.add(asset_ref)
+    return IRDrawing(
+        placeholder_key=placeholder,
+        asset_ref=asset_ref,
+        fmt=fmt,
+        src=src,
+    )
+
+
+__all__ = ["NativeMarkdownIRBuilder"]

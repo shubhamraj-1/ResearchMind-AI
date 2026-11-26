@@ -1,0 +1,358 @@
+"""Shared image-input normalization for LLM bindings.
+
+All LLM bindings accept a unified ``image_inputs`` keyword parameter. Each
+element may be:
+
+- a raw base64 string (the MIME type is inferred via ``imghdr`` / magic bytes,
+  defaulting to ``image/png``);
+- a data URL of the form ``data:<mime>;base64,<payload>`` (the scheme and
+  base64 marker are ASCII case-insensitive);
+- a dict with keys ``base64`` (required) and optional ``mime_type``,
+  ``source_id``, ``source_file``, ``modality``, ``doc_id``.
+
+A declared MIME type (from a data URL or the dict's ``mime_type``) is
+lowercased, as MIME types are case-insensitive while provider APIs and the
+cache key expect the canonical lowercase form. A known non-standard alias
+(``image/jpg``) is then mapped to its canonical type (``image/jpeg``): the
+Anthropic and Bedrock bindings pass the type into provider enums that reject
+the alias.
+
+The provider-specific binding code converts the normalized result to its own
+content-block format. The VLM pipeline uses :func:`image_cache_metadata` for
+cache-key inputs (deliberately excluding ``source_id`` / ``source_file`` so the
+same image at different filenames still hits the same entry) and
+:func:`image_audit_metadata` for the human-readable ``original_prompt`` audit
+block.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import re
+import struct
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import Any, BinaryIO
+
+DATA_URL_RE = re.compile(
+    r"^(?ai:data):(?P<mime>[\w./+-]+);(?ai:base64),(?P<data>[A-Za-z0-9+/=\s]+)$"
+)
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIGNATURE = b"\xff\xd8\xff"
+_GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
+_WEBP_RIFF = b"RIFF"
+_WEBP_TAG = b"WEBP"
+
+# Bytes read to identify a file and decode a non-JPEG header. Must cover the
+# furthest offset any fixed-layout reader below touches: WebP needs the first
+# 30 bytes, PNG 24, GIF 10. Raise it with any new reader that reads further.
+# JPEG is scanned segment by segment instead.
+_HEADER_PROBE_BYTES = 32
+
+# Upper bound on marker and fill-byte reads while scanning JPEG segments for
+# the frame header. Segment bodies are skipped with a seek, so legitimate
+# files cost one step per segment; this only stops crafted inputs (runs of
+# fill bytes or minimal segments) from turning a header probe into a
+# file-sized, event-loop-blocking scan. Exhausting it yields "unknown".
+_JPEG_MAX_SCAN_STEPS = 4096
+
+
+@dataclass(frozen=True)
+class NormalizedImage:
+    index: int
+    raw_bytes: bytes
+    mime_type: str
+    sha256: str
+    base64_str: str
+    source_id: str | None
+    source_file: str | None
+    modality: str | None
+    doc_id: str | None
+    # Pixel dimensions parsed from the raster header (None when the format
+    # is recognized but dimensions could not be extracted).
+    width: int | None = None
+    height: int | None = None
+
+
+def _detect_mime(raw: bytes) -> str:
+    if raw.startswith(_PNG_SIGNATURE):
+        return "image/png"
+    if raw.startswith(_JPEG_SIGNATURE):
+        return "image/jpeg"
+    if any(raw.startswith(sig) for sig in _GIF_SIGNATURES):
+        return "image/gif"
+    if len(raw) >= 12 and raw[0:4] == _WEBP_RIFF and raw[8:12] == _WEBP_TAG:
+        return "image/webp"
+    return "image/png"
+
+
+# Declared non-standard aliases -> canonical type (see the module docstring).
+_MIME_ALIASES = {
+    "image/jpg": "image/jpeg",
+}
+
+
+def _decode_base64(data: str) -> bytes:
+    cleaned = re.sub(r"\s+", "", data)
+    try:
+        return base64.b64decode(cleaned, validate=True)
+    except (base64.binascii.Error, ValueError) as exc:
+        raise ValueError(f"invalid base64 image data: {exc}") from exc
+
+
+def _coerce_item(item: Any) -> dict[str, Any]:
+    if isinstance(item, str):
+        match = DATA_URL_RE.match(item.strip())
+        if match:
+            return {"base64": match.group("data"), "mime_type": match.group("mime")}
+        return {"base64": item}
+    if isinstance(item, dict):
+        if "base64" not in item:
+            raise ValueError("image_inputs dict element must contain a 'base64' key")
+        return item
+    raise TypeError(
+        f"image_inputs element must be str or dict, got {type(item).__name__}"
+    )
+
+
+def normalize_image_inputs(
+    image_inputs: list[Any] | None,
+) -> list[NormalizedImage]:
+    """Normalize the unified ``image_inputs`` parameter.
+
+    Returns an empty list when ``image_inputs`` is falsy, so callers can do a
+    plain ``if normalized:`` check.
+    """
+    if not image_inputs:
+        return []
+
+    result: list[NormalizedImage] = []
+    for idx, raw_item in enumerate(image_inputs):
+        item = _coerce_item(raw_item)
+        raw_bytes = _decode_base64(item["base64"])
+        if not raw_bytes:
+            raise ValueError(f"image_inputs[{idx}] decoded to empty bytes")
+        mime_type = item.get("mime_type") or _detect_mime(raw_bytes)
+        if isinstance(mime_type, str):
+            mime_type = mime_type.lower()
+            mime_type = _MIME_ALIASES.get(mime_type, mime_type)
+        sha = hashlib.sha256(raw_bytes).hexdigest()
+        clean_b64 = base64.b64encode(raw_bytes).decode("ascii")
+        dims = _dimensions_from_bytes(raw_bytes)
+        width, height = (dims[0], dims[1]) if dims else (None, None)
+        result.append(
+            NormalizedImage(
+                index=idx,
+                raw_bytes=raw_bytes,
+                mime_type=mime_type,
+                sha256=sha,
+                base64_str=clean_b64,
+                source_id=item.get("source_id"),
+                source_file=item.get("source_file"),
+                modality=item.get("modality"),
+                doc_id=item.get("doc_id"),
+                width=width,
+                height=height,
+            )
+        )
+    return result
+
+
+def image_cache_metadata(images: list[NormalizedImage]) -> list[dict[str, Any]]:
+    """Return cache-key-safe image metadata (no source identifiers).
+
+    Includes ``width`` / ``height`` so the cache key reflects the full
+    image digest the design contract specifies (mime, sha256, bytes,
+    width, height).  The sha256 alone is sufficient for identity, but
+    surfacing dimensions matches the documented audit shape and gives
+    diagnostics a one-line "what was sent" without re-decoding.
+    """
+    return [
+        {
+            "index": img.index,
+            "mime_type": img.mime_type,
+            "sha256": img.sha256,
+            "bytes": len(img.raw_bytes),
+            "width": img.width,
+            "height": img.height,
+        }
+        for img in images
+    ]
+
+
+def image_audit_metadata(images: list[NormalizedImage]) -> list[dict[str, Any]]:
+    """Return audit metadata suitable for the ``original_prompt`` block.
+
+    Never includes the raw base64 payload — only digests and source pointers.
+    """
+    return [
+        {
+            "index": img.index,
+            "mime_type": img.mime_type,
+            "sha256": img.sha256,
+            "bytes": len(img.raw_bytes),
+            "width": img.width,
+            "height": img.height,
+            "source_id": img.source_id,
+            "source_file": img.source_file,
+            "modality": img.modality,
+            "doc_id": img.doc_id,
+        }
+        for img in images
+    ]
+
+
+def _read_png_dimensions(data: bytes) -> tuple[int, int] | None:
+    # IHDR is the first chunk; width/height are big-endian uint32 at offsets
+    # 16/20 (8-byte signature + 4 length + 4 "IHDR" + 4 width + 4 height).
+    if len(data) < 24 or not data.startswith(_PNG_SIGNATURE):
+        return None
+    width, height = struct.unpack(">II", data[16:24])
+    return width, height
+
+
+def _read_gif_dimensions(data: bytes) -> tuple[int, int] | None:
+    # Logical screen descriptor: width/height are little-endian uint16 at
+    # offsets 6/8.
+    if len(data) < 10 or not any(data.startswith(sig) for sig in _GIF_SIGNATURES):
+        return None
+    width, height = struct.unpack("<HH", data[6:10])
+    return width, height
+
+
+def _read_jpeg_dimensions(
+    data: bytes | bytearray | memoryview | BinaryIO,
+) -> tuple[int, int] | None:
+    # Scan for a Start-Of-Frame marker (SOF0 / SOF2 / etc.). Skip segments by
+    # their length field. We deliberately accept any SOF variant the codec
+    # might emit rather than enumerating each one. The scan is bounded by
+    # _JPEG_MAX_SCAN_STEPS, not by the input size.
+    stream = BytesIO(data) if isinstance(data, (bytes, bytearray, memoryview)) else data
+    if stream.read(2) != b"\xff\xd8":
+        return None
+    steps = 0
+    while True:
+        steps += 1
+        if steps > _JPEG_MAX_SCAN_STEPS:
+            return None
+        if stream.read(1) != b"\xff":
+            return None
+        # Skip fill bytes.
+        marker_byte = stream.read(1)
+        while marker_byte == b"\xff":
+            steps += 1
+            if steps > _JPEG_MAX_SCAN_STEPS:
+                return None
+            marker_byte = stream.read(1)
+        if not marker_byte:
+            return None
+        marker = marker_byte[0]
+        if marker in (0xD9, 0xDA):
+            return None
+        # Standalone markers without a length field.
+        if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+            continue
+        length_bytes = stream.read(2)
+        if len(length_bytes) != 2:
+            return None
+        segment_len = struct.unpack(">H", length_bytes)[0]
+        if segment_len < 2:
+            return None
+        # SOF0..SOF15 except 0xC4 (DHT), 0xC8 (JPG reserved), 0xCC (DAC).
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            # SOF payload: precision(1) + height(2) + width(2) + …
+            frame = stream.read(segment_len - 2)
+            if segment_len < 7 or len(frame) != segment_len - 2:
+                return None
+            height, width = struct.unpack(">HH", frame[1:5])
+            return width, height
+        stream.seek(segment_len - 2, 1)
+
+
+def _read_webp_dimensions(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 30 or data[0:4] != _WEBP_RIFF or data[8:12] != _WEBP_TAG:
+        return None
+    chunk_type = data[12:16]
+    if chunk_type == b"VP8 ":
+        # Lossy: 3-byte tag + 3-byte sync code at offset 23, then 4 bytes
+        # holding 14-bit width / 14-bit height in little-endian halves.
+        if len(data) < 30:
+            return None
+        width = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+        height = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+        return width, height
+    if chunk_type == b"VP8L":
+        # Lossless: signature(0x2F) + 4 bytes encoding 14-bit width-1 / 14-bit
+        # height-1 starting at offset 21.
+        if len(data) < 25 or data[20] != 0x2F:
+            return None
+        b0, b1, b2, b3 = data[21], data[22], data[23], data[24]
+        width = ((b1 & 0x3F) << 8 | b0) + 1
+        height = ((b3 & 0x0F) << 10 | b2 << 2 | (b1 & 0xC0) >> 6) + 1
+        return width, height
+    if chunk_type == b"VP8X":
+        # Extended: 3 bytes width-1 / 3 bytes height-1, little-endian, at
+        # offsets 24/27.
+        if len(data) < 30:
+            return None
+        width = (data[24] | data[25] << 8 | data[26] << 16) + 1
+        height = (data[27] | data[28] << 8 | data[29] << 16) + 1
+        return width, height
+    return None
+
+
+def read_image_dimensions(path: Path) -> tuple[int, int] | None:
+    """Return ``(width, height)`` for a raster image, or ``None`` if unknown.
+
+    No Pillow dependency. Supports PNG, JPEG, GIF and WebP (VP8 / VP8L /
+    VP8X). PNG, GIF and WebP are decoded from the first
+    ``_HEADER_PROBE_BYTES``; JPEG is scanned segment by segment so a frame
+    header behind large metadata is still found, with the work bounded by
+    ``_JPEG_MAX_SCAN_STEPS`` rather than by the file size. Returns ``None``
+    for unsupported formats, on any I/O or parse error, and when the JPEG
+    scan budget runs out, so callers can fall back to a skipped/failure
+    decision without raising.
+    """
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(_HEADER_PROBE_BYTES)
+            if header.startswith(_JPEG_SIGNATURE):
+                # Frame headers may follow multiple large metadata segments.
+                fh.seek(0)
+                return _read_jpeg_dimensions(fh)
+    except OSError:
+        return None
+    return _dimensions_from_bytes(header)
+
+
+def _dimensions_from_bytes(
+    data: bytes | bytearray | memoryview,
+) -> tuple[int, int] | None:
+    """Run the four header readers against a byte buffer.
+
+    Shared between the file-path entry point (:func:`read_image_dimensions`)
+    and :func:`normalize_image_inputs`, which receives raster payloads
+    decoded from the unified ``image_inputs`` parameter. Any bytes-like
+    buffer is accepted; it is converted once because the fixed-layout
+    readers rely on ``bytes`` methods.
+    """
+    if not data:
+        return None
+    if not isinstance(data, bytes):
+        data = bytes(data)
+    for reader in (
+        _read_png_dimensions,
+        _read_gif_dimensions,
+        _read_jpeg_dimensions,
+        _read_webp_dimensions,
+    ):
+        try:
+            dims = reader(data)
+        except (struct.error, IndexError, ValueError):
+            continue
+        if dims:
+            return dims
+    return None

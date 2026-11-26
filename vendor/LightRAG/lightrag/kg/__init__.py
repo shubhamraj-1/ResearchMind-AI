@@ -1,0 +1,229 @@
+STORAGE_IMPLEMENTATIONS = {
+    "KV_STORAGE": {
+        "implementations": [
+            "JsonKVStorage",
+            "RedisKVStorage",
+            "PGKVStorage",
+            "MongoKVStorage",
+            "OpenSearchKVStorage",
+        ],
+        "required_methods": ["get_by_id", "upsert"],
+    },
+    "GRAPH_STORAGE": {
+        "implementations": [
+            "NetworkXStorage",
+            "Neo4JStorage",
+            "PGGraphStorage",
+            "PGTableGraphStorage",
+            "MongoGraphStorage",
+            "MemgraphStorage",
+            "OpenSearchGraphStorage",
+        ],
+        "required_methods": ["upsert_node", "upsert_edge"],
+    },
+    "VECTOR_STORAGE": {
+        "implementations": [
+            "NoopVectorDBStorage",
+            "NanoVectorDBStorage",
+            "MilvusVectorDBStorage",
+            "PGVectorStorage",
+            "FaissVectorDBStorage",
+            "QdrantVectorDBStorage",
+            "MongoVectorDBStorage",
+            "OpenSearchVectorDBStorage",
+            # "ChromaVectorDBStorage",
+        ],
+        "required_methods": ["query", "upsert"],
+    },
+    "DOC_STATUS_STORAGE": {
+        "implementations": [
+            "JsonDocStatusStorage",
+            "RedisDocStatusStorage",
+            "PGDocStatusStorage",
+            "MongoDocStatusStorage",
+            "OpenSearchDocStatusStorage",
+        ],
+        "required_methods": ["get_docs_by_statuses"],
+    },
+    # The configuration storage is its OWN category, selected independently of
+    # the four business ones. Four backends, and the list is closed:
+    #
+    # * ``RedisKVStorage`` is deliberately absent. Redis is being retired from
+    #   business storage, and the configuration path must not be the reason
+    #   its enumeration surface is kept alive.
+    # * **No vector storage may serve here.** None appears in any KV list
+    #   today, and this records it as a rule: a vector container's name is
+    #   derived from the embedding configuration, which is exactly the
+    #   assertion the baselines exist to be independent of -- and the
+    #   configuration storage has to be readable BEFORE any vector storage
+    #   initializes (step 3 of the startup sequence).
+    #
+    # See docs/design/ConfigurationStorageContract.md.
+    "CONFIG_STORAGE": {
+        "implementations": [
+            "JsonKVStorage",
+            "MongoKVStorage",
+            "PGKVStorage",
+            "OpenSearchKVStorage",
+        ],
+        "required_methods": ["get_by_id_strict", "upsert", "iter_rows"],
+    },
+}
+
+# Backends still accepted but scheduled for removal, mapped to the recommended
+# replacement. Selecting one works unchanged; startup only warns about it.
+DEPRECATED_STORAGES: dict[str, str] = {
+    "RedisKVStorage": "PGKVStorage",
+    "RedisDocStatusStorage": "PGDocStatusStorage",
+    "PGGraphStorage": "PGTableGraphStorage",
+}
+
+# How to get to the replacement, where a tool does it without re-indexing.
+# The notice appends this; every key must also be in DEPRECATED_STORAGES.
+DEPRECATED_STORAGE_MIGRATION_HINTS: dict[str, str] = {
+    "PGGraphStorage": (
+        "`python -m lightrag.tools.migrate_graph_storage --apply` moves the "
+        "graph without re-indexing the documents."
+    ),
+}
+
+# Storage implementation environment variable without default value
+STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
+    # KV Storage Implementations
+    "JsonKVStorage": [],
+    "MongoKVStorage": [
+        "MONGO_URI",
+        "MONGO_DATABASE",
+    ],
+    "RedisKVStorage": ["REDIS_URI"],
+    "PGKVStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
+    # Graph Storage Implementations
+    "NetworkXStorage": [],
+    "Neo4JStorage": ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"],
+    "MongoGraphStorage": [
+        "MONGO_URI",
+        "MONGO_DATABASE",
+    ],
+    "MemgraphStorage": ["MEMGRAPH_URI"],
+    "AGEStorage": [
+        "AGE_POSTGRES_DB",
+        "AGE_POSTGRES_USER",
+        "AGE_POSTGRES_PASSWORD",
+    ],
+    "PGGraphStorage": [
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_DATABASE",
+    ],
+    "PGTableGraphStorage": [
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_DATABASE",
+    ],
+    # Vector Storage Implementations
+    "NoopVectorDBStorage": [],
+    "NanoVectorDBStorage": [],
+    "MilvusVectorDBStorage": [
+        "MILVUS_URI",
+        "MILVUS_DB_NAME",
+    ],
+    # "ChromaVectorDBStorage": [],
+    "PGVectorStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
+    "FaissVectorDBStorage": [],
+    "QdrantVectorDBStorage": ["QDRANT_URL"],  # QDRANT_API_KEY has default value None
+    "MongoVectorDBStorage": [
+        "MONGO_URI",
+        "MONGO_DATABASE",
+    ],
+    # Document Status Storage Implementations
+    "JsonDocStatusStorage": [],
+    "RedisDocStatusStorage": ["REDIS_URI"],
+    "PGDocStatusStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
+    "MongoDocStatusStorage": [
+        "MONGO_URI",
+        "MONGO_DATABASE",
+    ],
+    # OpenSearch Storage Implementations
+    "OpenSearchKVStorage": [
+        "OPENSEARCH_HOSTS",
+    ],
+    "OpenSearchDocStatusStorage": [
+        "OPENSEARCH_HOSTS",
+    ],
+    "OpenSearchGraphStorage": [
+        "OPENSEARCH_HOSTS",
+    ],
+    "OpenSearchVectorDBStorage": [
+        "OPENSEARCH_HOSTS",
+    ],
+}
+
+# Storage implementation module mapping
+STORAGES = {
+    "NetworkXStorage": ".kg.networkx_impl",
+    "JsonKVStorage": ".kg.json_kv_impl",
+    "NanoVectorDBStorage": ".kg.nano_vector_db_impl",
+    "NoopVectorDBStorage": ".kg.noop_vector_db_impl",
+    "JsonDocStatusStorage": ".kg.json_doc_status_impl",
+    "Neo4JStorage": ".kg.neo4j_impl",
+    "MilvusVectorDBStorage": ".kg.milvus_impl",
+    "MongoKVStorage": ".kg.mongo_impl",
+    "MongoDocStatusStorage": ".kg.mongo_impl",
+    "MongoGraphStorage": ".kg.mongo_impl",
+    "MongoVectorDBStorage": ".kg.mongo_impl",
+    "RedisKVStorage": ".kg.redis_impl",
+    "RedisDocStatusStorage": ".kg.redis_impl",
+    "ChromaVectorDBStorage": ".kg.chroma_impl",
+    "PGKVStorage": ".kg.postgres_impl",
+    "PGVectorStorage": ".kg.postgres_impl",
+    "AGEStorage": ".kg.age_impl",
+    "PGGraphStorage": ".kg.postgres_impl",
+    "PGTableGraphStorage": ".kg.pgtable_impl",
+    "PGDocStatusStorage": ".kg.postgres_impl",
+    "FaissVectorDBStorage": ".kg.faiss_impl",
+    "QdrantVectorDBStorage": ".kg.qdrant_impl",
+    "MemgraphStorage": ".kg.memgraph_impl",
+    "OpenSearchKVStorage": ".kg.opensearch_impl",
+    "OpenSearchDocStatusStorage": ".kg.opensearch_impl",
+    "OpenSearchGraphStorage": ".kg.opensearch_impl",
+    "OpenSearchVectorDBStorage": ".kg.opensearch_impl",
+}
+
+
+def verify_storage_implementation(storage_type: str, storage_name: str) -> None:
+    """Verify if storage implementation is compatible with specified storage type
+
+    Args:
+        storage_type: Storage type (KV_STORAGE, GRAPH_STORAGE etc.)
+        storage_name: Storage implementation name
+
+    Raises:
+        ValueError: If storage implementation is incompatible or missing required methods
+    """
+    if storage_type not in STORAGE_IMPLEMENTATIONS:
+        raise ValueError(f"Unknown storage type: {storage_type}")
+
+    storage_info = STORAGE_IMPLEMENTATIONS[storage_type]
+    if storage_name not in storage_info["implementations"]:
+        raise ValueError(
+            f"Storage implementation '{storage_name}' is not compatible with {storage_type}. "
+            f"Compatible implementations are: {', '.join(storage_info['implementations'])}"
+        )
+
+
+def deprecated_storage_message(storage_name: str) -> str | None:
+    """Return the deprecation notice for a storage backend.
+
+    Returns None when the backend is not deprecated. The core startup warning
+    and the server splash screen both print this text, so the wording lives
+    in one place.
+    """
+    replacement = DEPRECATED_STORAGES.get(storage_name)
+    if replacement is None:
+        return None
+    message = (
+        f"{storage_name} is deprecated and will be removed in a future release; "
+        f"migrate to {replacement} (PostgreSQL)."
+    )
+    hint = DEPRECATED_STORAGE_MIGRATION_HINTS.get(storage_name)
+    return f"{message} {hint}" if hint else message

@@ -1,0 +1,154 @@
+#!/usr/bin/env python
+"""
+Unit tests guarding against Cypher injection through the workspace label.
+
+The workspace label is interpolated into two different syntactic contexts in
+``neo4j_impl.py``:
+
+1. Backtick-quoted identifiers, e.g. ``MATCH (n:`{label}`)`` — here backticks
+   must be doubled and all other characters (including single quotes) are
+   literal.
+2. String-literal contexts. Cypher string literals are NOT escaped by
+   doubling quotes (that is SQL); they use backslash escaping. Rather than
+   escape by hand, the raw label must be bound as a query parameter.
+
+``get_knowledge_graph`` used to pass the label to APOC ``labelFilter``. That
+config is gone (APOC parses it as its own filter syntax, which broke workspace
+names containing ``:`` ``,`` ``|`` ``+``), so the label must not reach the
+APOC call at all.
+
+These tests run without a live Neo4j instance.
+"""
+
+import pytest
+
+from lightrag.kg.neo4j_impl import Neo4JStorage
+
+
+pytestmark = pytest.mark.offline
+
+
+def _make_storage(workspace: str) -> Neo4JStorage:
+    """Create a Neo4JStorage with a given workspace (no connection)."""
+    return Neo4JStorage(
+        namespace="test",
+        global_config={},
+        embedding_func=None,
+        workspace=workspace if workspace else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _get_workspace_label: backtick-identifier context
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "workspace, expected",
+    [
+        # Every backtick is doubled, not only the first.
+        ("a`b`c", "a``b``c"),
+        # A breakout attempt stays inside the quoted identifier.
+        ("ws`} RETURN 0", "ws``} RETURN 0"),
+        # Single quotes are NOT touched: inside backticks they are literal, so
+        # doubling them would corrupt the label name. This label is built from
+        # _get_raw_workspace_label, whose stripping and "base" default are
+        # pinned by the table below.
+        ("ws'`name", "ws'``name"),
+    ],
+)
+def test_get_workspace_label(workspace, expected):
+    storage = _make_storage(workspace)
+    assert storage._get_workspace_label() == expected
+
+
+# ---------------------------------------------------------------------------
+# _get_raw_workspace_label: the actual label name, bound as a parameter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "workspace, expected",
+    [
+        ("  trimmed  ", "trimmed"),
+        ("", "base"),
+        ("   ", "base"),
+        # No escaping of any kind: the raw value is bound, never interpolated.
+        ("ws`name", "ws`name"),
+        ("x'); CALL apoc.util.sleep(1);", "x'); CALL apoc.util.sleep(1);"),
+    ],
+)
+def test_get_raw_workspace_label(workspace, expected):
+    storage = _make_storage(workspace)
+    assert storage._get_raw_workspace_label() == expected
+
+
+# ---------------------------------------------------------------------------
+# get_knowledge_graph: the workspace label never reaches the APOC config
+# ---------------------------------------------------------------------------
+
+
+class _FakeResult:
+    def __init__(self, record):
+        self._record = record
+
+    async def single(self):
+        return self._record
+
+    async def consume(self):
+        return None
+
+
+class _FakeSession:
+    """Records every (query, params) pair passed to ``run``."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def run(self, query, params=None):
+        self.calls.append((query, params or {}))
+        # total_nodes within limit -> the full result is used directly and the
+        # truncated/limited branch is never taken (a single run call).
+        return _FakeResult({"total_nodes": 0, "node_info": [], "relationships": []})
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeDriver:
+    def __init__(self, session):
+        self._session = session
+
+    def session(self, **kwargs):
+        return self._session
+
+
+@pytest.mark.asyncio
+async def test_subgraph_query_has_no_label_filter():
+    """The APOC subgraph call must not carry the workspace label.
+
+    APOC ``labelFilter`` is parsed with its own syntax, so passing the
+    workspace there filtered out the workspace's own nodes for names like
+    ``tenant:1``. The label must also never be interpolated into the APOC
+    config, or a single quote in it would inject Cypher.
+    """
+    payload = "x'); CALL apoc.util.sleep(1);"
+    storage = _make_storage(payload)
+    session = _FakeSession()
+    storage._driver = _FakeDriver(session)
+    storage._DATABASE = None
+
+    await storage.get_knowledge_graph(node_label="some-entity", max_depth=2)
+
+    subgraph_calls = [(q, p) for q, p in session.calls if "apoc.path.subgraphAll" in q]
+    assert subgraph_calls, "expected an apoc.path.subgraphAll query"
+
+    for query, params in subgraph_calls:
+        assert "labelFilter:" not in query
+        assert "label_filter" not in params
+        # The only place the label appears is the backtick-quoted start MATCH.
+        apoc_config = query[query.index("apoc.path.subgraphAll") :]
+        assert payload not in apoc_config

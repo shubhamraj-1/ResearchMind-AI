@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "frontend"
+		},
+		{
+			"path": "backend"
+		},
+		{
+			"path": "vendor"
+		},
+		{
+			"path": ".venv"
+		}
+	]
+}

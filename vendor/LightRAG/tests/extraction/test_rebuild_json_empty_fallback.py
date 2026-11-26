@@ -1,0 +1,49 @@
+"""A cached extraction result that is valid, empty JSON must not fall through
+to the delimiter parser: that parser has no chance of finding a
+"<|COMPLETE|>" marker in a JSON payload and would log a misleading warning
+about it, even though the JSON was parsed successfully and simply carried no
+entities or relationships.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import pytest
+
+from lightrag.operate import _rebuild_from_extraction_result
+
+pytestmark = pytest.mark.offline
+
+
+class DummyKV:
+    async def get_by_id(self, key):
+        return {"file_path": "doc.pdf"}
+
+
+@pytest.mark.asyncio
+async def test_rebuild_accepts_valid_empty_json_without_delimiter_warning(
+    caplog, lightrag_caplog
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="lightrag"):
+        nodes, edges = await _rebuild_from_extraction_result(
+            DummyKV(),
+            '{"entities": [], "relationships": []}',
+            chunk_id="chunk-1",
+            timestamp=1,
+        )
+    assert nodes == {}
+    assert edges == {}
+    assert "Complete delimiter can not be found" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rebuild_still_returns_entities_from_nonempty_json() -> None:
+    nodes, edges = await _rebuild_from_extraction_result(
+        DummyKV(),
+        '{"entities":[{"name":"Alice","type":"person",'
+        '"description":"an engineer"}],"relationships":[]}',
+        chunk_id="chunk-2",
+        timestamp=1,
+    )
+    assert "Alice" in nodes
